@@ -1,0 +1,244 @@
+name: Build Homarr Rich iCal Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build.yml
+      - scripts/**
+      - patches/**
+      - HOMARR_VERSION
+      - README.md
+      - docs/**
+  pull_request:
+    paths:
+      - .github/workflows/build.yml
+      - scripts/**
+      - patches/**
+      - HOMARR_VERSION
+      - README.md
+      - docs/**
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      homarr_version:
+        description: Homarr version; empty uses HOMARR_VERSION
+        required: false
+        type: string
+      publish:
+        description: Push the exact version image
+        required: true
+        default: true
+        type: boolean
+      update_moving_tag:
+        description: Update rich-ical after the exact tag exists
+        required: true
+        default: true
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  REGISTRY_OWNER: hyperclaw79
+  IMAGE_NAME: homarr
+  TAG_SUFFIX: rich-ical
+  DOCKER_BUILD_SUMMARY: "false"
+
+concurrency:
+  group: homarr-rich-ical-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build / publish image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve build settings
+        id: settings
+        shell: bash
+        env:
+          INPUT_HOMARR_VERSION: ${{ inputs.homarr_version }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          INPUT_UPDATE_MOVING_TAG: ${{ inputs.update_moving_tag }}
+        run: |
+          set -Eeuo pipefail
+
+          publish="false"
+          update_moving_tag="false"
+          automatic="false"
+
+          case "$GITHUB_EVENT_NAME" in
+            schedule)
+              version="$(bash scripts/resolve-homarr-version.sh --latest)"
+              publish="true"
+              update_moving_tag="true"
+              automatic="true"
+              ;;
+            workflow_dispatch)
+              version="$(bash scripts/resolve-homarr-version.sh "$INPUT_HOMARR_VERSION")"
+              publish="$INPUT_PUBLISH"
+              update_moving_tag="$INPUT_UPDATE_MOVING_TAG"
+              ;;
+            *)
+              version="$(bash scripts/resolve-homarr-version.sh)"
+              ;;
+          esac
+
+          image_base="$REGISTRY/$REGISTRY_OWNER/$IMAGE_NAME"
+          image_exact="$image_base:$version-$TAG_SUFFIX"
+          image_moving="$image_base:$TAG_SUFFIX"
+
+          {
+            echo "version=$version"
+            echo "upstream_tag=v$version"
+            echo "publish=$publish"
+            echo "update_moving_tag=$update_moving_tag"
+            echo "automatic=$automatic"
+            echo "image_exact=$image_exact"
+            echo "image_moving=$image_moving"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Upstream Homarr tag: v$version"
+          echo "Exact image: $image_exact"
+          echo "Publish: $publish"
+          echo "Update moving tag: $update_moving_tag"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: ${{ steps.settings.outputs.publish == 'true' }}
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check exact image
+        id: existing
+        if: ${{ steps.settings.outputs.publish == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if docker buildx imagetools inspect "${{ steps.settings.outputs.image_exact }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Exact image already exists; no rebuild is needed."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require publish-time icon secret
+        if: ${{ steps.settings.outputs.publish == 'true' && steps.existing.outputs.exists != 'true' }}
+        shell: bash
+        env:
+          SEANIME_ICON_URL: ${{ secrets.SEANIME_ICON_URL }}
+        run: |
+          set -Eeuo pipefail
+          [[ -n "$SEANIME_ICON_URL" ]] || {
+            echo "Repository secret SEANIME_ICON_URL is not configured." >&2
+            exit 1
+          }
+
+      - name: Build exact version image
+        if: ${{ steps.settings.outputs.publish != 'true' || steps.existing.outputs.exists != 'true' }}
+        shell: bash
+        env:
+          SEANIME_ICON_URL: ${{ secrets.SEANIME_ICON_URL }}
+          REQUIRE_SEANIME_ICON_URL: ${{ steps.settings.outputs.publish }}
+          BUILDX_CACHE_FROM: type=gha,scope=homarr-rich-ical
+          BUILDX_CACHE_TO: type=gha,scope=homarr-rich-ical,mode=max
+        run: |
+          set -Eeuo pipefail
+          args=(
+            --homarr-version "${{ steps.settings.outputs.version }}"
+            --registry "$REGISTRY"
+            --registry-owner "$REGISTRY_OWNER"
+            --image-name "$IMAGE_NAME"
+            --tag-suffix "$TAG_SUFFIX"
+            --platform linux/amd64
+          )
+          if [[ "${{ steps.settings.outputs.publish }}" == "true" ]]; then
+            args+=(--push)
+          else
+            args+=(--load)
+          fi
+          bash scripts/build-rich-ical.sh "${args[@]}"
+
+      - name: Promote exact image to moving tag
+        if: ${{ steps.settings.outputs.publish == 'true' && steps.settings.outputs.update_moving_tag == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker buildx imagetools create \
+            --tag "${{ steps.settings.outputs.image_moving }}" \
+            "${{ steps.settings.outputs.image_exact }}"
+          echo "Moving tag updated: ${{ steps.settings.outputs.image_moving }}"
+
+      - name: Record automatically detected version
+        if: ${{ steps.settings.outputs.automatic == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          version="${{ steps.settings.outputs.version }}"
+          current="$(tr -d '[:space:]' < HOMARR_VERSION)"
+          if [[ "$current" == "$version" ]]; then
+            exit 0
+          fi
+          printf '%s\n' "$version" > HOMARR_VERSION
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add HOMARR_VERSION
+          git commit -m "Track Homarr $version"
+          git push
+
+      - name: Write build metadata
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          published="${{ steps.settings.outputs.publish == 'true' }}"
+          cat > build-metadata.json <<EOF
+          {
+            "homarr_version": "${{ steps.settings.outputs.version }}",
+            "upstream_tag": "${{ steps.settings.outputs.upstream_tag }}",
+            "image_exact": "${{ steps.settings.outputs.image_exact }}",
+            "image_moving": "${{ steps.settings.outputs.image_moving }}",
+            "published": $published,
+            "patch_file": "patches/ical-integration.rich.ts"
+          }
+          EOF
+          cat build-metadata.json
+
+      - name: Upload build evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: homarr-rich-ical-build-evidence
+          path: |
+            build-metadata.json
+            artifacts/homarr-rich-ical.patch.diff
+          if-no-files-found: warn
+
+      - name: Workflow summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          {
+            echo "## Homarr rich iCal build"
+            echo
+            echo "- Upstream: \`${{ steps.settings.outputs.upstream_tag }}\`"
+            echo "- Exact image: \`${{ steps.settings.outputs.image_exact }}\`"
+            echo "- Moving image: \`${{ steps.settings.outputs.image_moving }}\`"
+            echo "- Publish requested: \`${{ steps.settings.outputs.publish }}\`"
+            echo "- Job result: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
